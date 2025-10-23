@@ -1,0 +1,21 @@
+# Changes here will be overwritten by Copier; NEVER EDIT MANUALLY
+_commit: v1.1.0
+_src_path: https://github.com/napari/napari-plugin-template
+display_name: Segment Any Confocal Images
+email: fenghuibao@gmail.com
+full_name: Huibao Feng
+github_repository_url: provide later
+github_username_or_organization: fenghuibao
+include_reader_plugin: true
+include_sample_data_plugin: true
+include_widget_plugin: true
+include_writer_plugin: true
+install_dependabot: true
+install_precommit: true
+license: MIT
+module_name: segment_any_confocal_images
+plugin_name: segment-any-confocal-images
+short_description: Segment Any Confocal Images is a flexible and high-performance
+    plugin designed for segmentation of confocal microscopy data. It supports both
+    2D and 3D image stacks, enabling users to identify and extract cellular or subcellular
+    structures with minimal manual effort.
