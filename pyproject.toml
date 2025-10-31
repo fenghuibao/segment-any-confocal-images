@@ -1,6 +1,7 @@
 [project]
 name = "segment-any-confocal-images"
-dynamic = ["version"]
+#dynamic = ["version"]
+version = "0.0.2"
 description = "Segment Any Confocal Images is a flexible and high-performance plugin designed for segmentation of confocal microscopy data. It supports both 2D and 3D image stacks, enabling users to identify and extract cellular or subcellular structures with minimal manual effort."
 readme = "README.md"
 license = {file = "LICENSE"}
