@@ -13,11 +13,16 @@ from qtpy.QtWidgets import (
 )
 from qtpy.QtCore import QTimer, Qt, QThread, Signal, QObject, QLocale
 
+from superqt import QRangeSlider  # dual-end range slider
+
 # external Frangi
 from frangi_filter.frangi_filter import *
 
 # external segmentation entry
 from SegmentAnyConfocal.segmentation_ import * 
+
+# intensity rescale
+from skimage.exposure import rescale_intensity
 
 # torch is optional
 try:
@@ -182,7 +187,7 @@ class SegWorker(QObject):
 class SegmentConfocalWidget(QWidget):
     """
     Napari widget with TC support, pixel/voxel-size editor, optional 2D-slice processing,
-    progress for segmentation, and external segmentation().
+    progress for segmentation, Frangi filtering, and optional post-Frangi intensity rescale.
     """
 
     def __init__(self, napari_viewer):
@@ -190,6 +195,8 @@ class SegmentConfocalWidget(QWidget):
         self.viewer = napari_viewer
         self._group_layers: List = []
         self._last_frangi_ctx: Dict[str, Any] = {}
+        self._frangi_layer = None  # handle to the latest Frangi layer
+        self._low_percent = 0  # track low percentile; high is 100 - low
 
         # ---- overall layout ----
         layout = QVBoxLayout(self)
@@ -246,7 +253,7 @@ class SegmentConfocalWidget(QWidget):
         info_grid.addWidget(QLabel("Voxel size:"), 2, 0, alignment=Qt.AlignRight)
         info_grid.addWidget(self.lbl_voxpix, 2, 1)
 
-        # editable voxel/pixel (columns Z/Y/X or Y/X)
+        # editable voxel/pixel (compact Y/X; Z optional)
         self.edit_vz = QDoubleSpinBox(); self.edit_vz.setDecimals(6); self.edit_vz.setRange(0, 1e3); self.edit_vz.setLocale(QLocale.c())
         self.edit_vyx = QDoubleSpinBox(); self.edit_vyx.setDecimals(6); self.edit_vyx.setRange(0, 1e3); self.edit_vyx.setLocale(QLocale.c())
         self.btn_apply_voxel = QPushButton("Update Voxel/Pixel size")
@@ -254,11 +261,9 @@ class SegmentConfocalWidget(QWidget):
         vox_row = 3
         info_grid.addWidget(QLabel("Edit size:"), vox_row, 0, alignment=Qt.AlignRight)
         col_widget = QWidget(); col_layout = QGridLayout(); col_layout.setContentsMargins(0,0,0,0); col_layout.setHorizontalSpacing(8)
-        # row 0: Z, Y, X
-        self.lblZ = QLabel("Z:"); self.lblYX = QLabel("Y/X:")#; self.lblX = QLabel("X:")
+        self.lblZ = QLabel("Z:"); self.lblYX = QLabel("Y/X:")
         col_layout.addWidget(self.lblZ, 0, 0, alignment=Qt.AlignRight); col_layout.addWidget(self.edit_vz, 0, 1)
         col_layout.addWidget(self.lblYX, 0, 2, alignment=Qt.AlignRight); col_layout.addWidget(self.edit_vyx, 0, 3)
-        #col_layout.addWidget(self.lblX, 0, 4, alignment=Qt.AlignRight); col_layout.addWidget(self.edit_vx, 0, 5)
         col_widget.setLayout(col_layout)
         info_grid.addWidget(col_widget, vox_row, 1)
         info_grid.addWidget(self.btn_apply_voxel, vox_row + 1, 1)
@@ -279,7 +284,7 @@ class SegmentConfocalWidget(QWidget):
         frangi_box = QGroupBox("Frangi Filter")
         fr_grid = QGridLayout(); fr_grid.setHorizontalSpacing(12); fr_grid.setVerticalSpacing(6)
 
-        # kernel radius & sigma count one row
+        # kernel radius & sigma count
         self.kernel_spin = QSpinBox(); self.kernel_spin.setRange(1, 5); self.kernel_spin.setValue(4)
         self.sigma_count = QSpinBox(); self.sigma_count.setRange(1, 99); self.sigma_count.setValue(5)
         fr_grid.addWidget(QLabel("Kernel radius:"), 0, 0, alignment=Qt.AlignRight)
@@ -287,7 +292,7 @@ class SegmentConfocalWidget(QWidget):
         fr_grid.addWidget(QLabel("Sigma count:"), 0, 2, alignment=Qt.AlignRight)
         fr_grid.addWidget(self.sigma_count, 0, 3)
 
-        # sigma min & max one row
+        # sigma min & max
         self.sigma_min = QDoubleSpinBox(); self.sigma_min.setDecimals(2); self.sigma_min.setRange(0.1, 5.0); self.sigma_min.setSingleStep(0.1); self.sigma_min.setValue(0.1); self.sigma_min.setLocale(QLocale.c())
         self.sigma_max = QDoubleSpinBox(); self.sigma_max.setDecimals(2); self.sigma_max.setRange(0.1, 5.0); self.sigma_max.setSingleStep(0.1); self.sigma_max.setValue(1.0); self.sigma_max.setLocale(QLocale.c())
         fr_grid.addWidget(QLabel("Sigma min:"), 1, 0, alignment=Qt.AlignRight)
@@ -306,11 +311,49 @@ class SegmentConfocalWidget(QWidget):
         row2d_layout.addWidget(self.chk_use_2d); row2d_layout.addWidget(QLabel("Frame Index:")); row2d_layout.addWidget(self.z_index_spin); row2d.setLayout(row2d_layout)
         fr_grid.addWidget(row2d, 2, 0, 1, 4)
 
+        # --- intensity rescale via dual-end slider, with high = 100 - low ---
+        self.chk_rescale = QCheckBox("Enable intensity rescale (percentiles)")
+        self.chk_rescale.setChecked(False)
+        self.chk_rescale.setEnabled(False)
+
+        self.range_slider = QRangeSlider(Qt.Horizontal)
+        self.range_slider.setRange(0, 100)
+        self.range_slider.setValue((0, 100))  # low=0, high=100
+        self.range_slider.setEnabled(False)
+
+        self.range_lbl = QLabel("percentiles: 0%–100%  (high = 100 - low)")
+
+        def _toggle_rescale(v):
+            enabled = bool(v) and (self._last_frangi_ctx.get("frangi_raw") is not None)
+            self.range_slider.setEnabled(enabled)
+            if enabled:
+                # ensure relation and bounds
+                self._apply_low_high_binding(self._low_percent)
+                self._recompute_rescaled_frangi()
+            else:
+                if self._last_frangi_ctx.get("frangi_raw") is not None and self._frangi_layer is not None:
+                    raw = self._last_frangi_ctx["frangi_raw"]
+                    self._frangi_layer.data = np.asarray(raw)
+                    self._last_frangi_ctx["frangi"] = np.asarray(raw)
+                    self._update_segmentation_preview()
+        self.chk_rescale.toggled.connect(_toggle_rescale)
+
+        fr_grid.addWidget(self.chk_rescale, 3, 0, 1, 4)
+
+        row_range = QWidget()
+        row_range_l = QHBoxLayout(); row_range_l.setContentsMargins(0, 0, 0, 0)
+        row_range_l.addWidget(QLabel("range"))
+        row_range_l.addWidget(self.range_slider)
+        row_range_l.addWidget(self.range_lbl)
+        row_range.setLayout(row_range_l)
+        fr_grid.addWidget(row_range, 4, 0, 1, 4)
+
+        # Apply Frangi
         self.apply_btn = QPushButton("Run Frangi Filter")
         self.apply_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.apply_btn.setMinimumHeight(32)
         self.apply_btn.clicked.connect(self._on_apply_frangi_clicked)
-        fr_grid.addWidget(self.apply_btn, 3, 0, 1, 4)
+        fr_grid.addWidget(self.apply_btn, 5, 0, 1, 4)
 
         frangi_box.setLayout(fr_grid)
         layout.addWidget(frangi_box)
@@ -319,7 +362,7 @@ class SegmentConfocalWidget(QWidget):
         seg_box = QGroupBox("Segmentation")
         seg_grid = QGridLayout(); seg_grid.setHorizontalSpacing(16); seg_grid.setVerticalSpacing(8)
 
-        # 2 decimals as requested
+        # 2 decimals
         self.beta1_spin = QDoubleSpinBox(); self.beta1_spin.setDecimals(2); self.beta1_spin.setRange(0.0, 10); self.beta1_spin.setSingleStep(0.01); self.beta1_spin.setValue(1.0); self.beta1_spin.setLocale(QLocale.c())
         self.beta2_spin = QDoubleSpinBox(); self.beta2_spin.setDecimals(2); self.beta2_spin.setRange(0.0, 10); self.beta2_spin.setSingleStep(0.01); self.beta2_spin.setValue(1.0); self.beta2_spin.setLocale(QLocale.c())
         self.cutoff_spin = QDoubleSpinBox(); self.cutoff_spin.setDecimals(2); self.cutoff_spin.setRange(0, 10); self.cutoff_spin.setSingleStep(0.01); self.cutoff_spin.setValue(2.0); self.cutoff_spin.setLocale(QLocale.c())
@@ -368,6 +411,9 @@ class SegmentConfocalWidget(QWidget):
             self.viewer.dims.events.current_step.connect(self._on_dims_step_changed)
         except Exception:
             pass
+
+        # slider change handler
+        self.range_slider.valueChanged.connect(self._on_rescale_params_changed)
 
         self._update_info()
         self._fit_view_and_scalebar()
@@ -479,11 +525,12 @@ class SegmentConfocalWidget(QWidget):
                 self._maybe_normalize_dragdrop_layer(layer)
             except Exception:
                 pass
+            self._view_initialized = False
+            self._fit_view_and_scalebar()
             self._update_info()
         QTimer.singleShot(0, _deferred)
 
     def _maybe_normalize_dragdrop_layer(self, layer):
-        # do not normalize derived layers (frangi/segmentation)
         md0 = getattr(layer, 'metadata', {}) or {}
         if md0.get('is_frangi') or md0.get('is_segmentation'):
             return
@@ -502,7 +549,6 @@ class SegmentConfocalWidget(QWidget):
             _safe_axis_labels(self.viewer, layer)
             T = int(layer.data.shape[0]) if layer.data.ndim >= 4 else 1
             same = [l for l in self.viewer.layers if getattr(l, "metadata", {}).get("source") == src]
-            # unify group_id across same-source layers
             gid = None
             for l in same:
                 gid = _get_group_id(l) or gid
@@ -520,8 +566,9 @@ class SegmentConfocalWidget(QWidget):
                     self.z_index_spin.setRange(0, 0)
             except Exception:
                 pass
+            self._view_initialized = False
+            self._fit_view_and_scalebar()
             return
-        # try reload via AICS
         try:
             data, meta = _load_image_tc_zyx(src)
             if data.shape[0] == 1 and data.shape[1] == 1 and layer.data.ndim <= 3:
@@ -581,6 +628,8 @@ class SegmentConfocalWidget(QWidget):
     # ----------------------- events -----------------------
 
     def _on_active_changed(self, event=None):
+        self._view_initialized = False
+        self._centered_once = False
         layer = self.viewer.layers.selection.active
         try:
             if hasattr(self, "_scale_conn") and self._scale_conn is not None:
@@ -627,20 +676,26 @@ class SegmentConfocalWidget(QWidget):
         if layer is None:
             return
         arr = np.asarray(layer.data)
-        if arr.ndim >= 3:
-            try:
-                dims = (getattr(layer, "metadata", {}) or {}).get("dims")
-                if dims == "TCZYX":
-                    zlen = int(arr.shape[2])
-                    zcur = int(self.viewer.dims.current_step[1])
-                else:
-                    zlen = int(arr.shape[-3])
-                    zcur = int(self.viewer.dims.current_step[-3])
-                self.z_index_spin.setRange(0, max(zlen - 1, 0))
-                if not self.z_index_spin.hasFocus():
-                    self.z_index_spin.setValue(max(min(zcur, zlen - 1), 0))
-            except Exception:
-                pass
+        nd = arr.ndim
+        if nd < 3:
+            return
+
+        try:
+            if not getattr(self, "_centered_once", False):
+                for ax in range(max(0, nd - 2)):
+                    if arr.shape[ax] > 1:
+                        self.viewer.dims.set_current_step(ax, int(arr.shape[ax] // 2))
+                self._centered_once = True
+
+            zlen = int(arr.shape[-3])
+            self.z_index_spin.setRange(0, max(zlen - 1, 0))
+
+            if not self.z_index_spin.hasFocus():
+                zcur = int(self.viewer.dims.current_step[-3])
+                self.z_index_spin.setValue(max(min(zcur, zlen - 1), 0))
+        except Exception:
+            pass
+
 
     # ----------------------- UI sync & view -----------------------
 
@@ -700,7 +755,6 @@ class SegmentConfocalWidget(QWidget):
         except Exception:
             pass
 
-        # preview kwargs if frangi already run
         self._update_segmentation_preview()
 
     def _fit_view_and_scalebar(self):
@@ -708,9 +762,7 @@ class SegmentConfocalWidget(QWidget):
         if layer is None or not hasattr(layer, "data"):
             return
 
-        # Only center the view the first time after image is fully added
         if hasattr(self, "_view_initialized") and self._view_initialized:
-            # Already initialized, only refresh scale bar and labels
             try:
                 self.viewer.scale_bar.visible = True
                 unit = (getattr(layer, "metadata", {}) or {}).get("unit", "um")
@@ -722,31 +774,22 @@ class SegmentConfocalWidget(QWidget):
             _safe_axis_labels(self.viewer, layer)
             return
 
-        # Mark initialized immediately to avoid repeated triggering
         self._view_initialized = True
 
         try:
-            # Ensure the layer's extent and scale are valid before centering
             if np.all(np.isfinite(layer.extent.world[0])) and np.all(np.isfinite(layer.extent.world[1])):
                 self.viewer.reset_view()
 
             nd, sh = layer.data.ndim, layer.data.shape
-            dims = (getattr(layer, "metadata", {}) or {}).get("dims")
-
-            if dims == "TCZYX":
-                if sh[0] > 1:
-                    self.viewer.dims.set_current_step(0, int(sh[0] // 2))  # center T
-                if sh[2] > 1:
-                    self.viewer.dims.set_current_step(1, int(sh[2] // 2))  # center Z
-            else:
-                if nd >= 4 and sh[0] > 1:
-                    self.viewer.dims.set_current_step(0, int(sh[0] // 2))
-                if nd >= 3 and sh[-3] > 1:
-                    self.viewer.dims.set_current_step(nd - 3, int(sh[-3] // 2))
+            for ax in range(max(0, nd - 2)):
+                if sh[ax] > 1:
+                    try:
+                        self.viewer.dims.set_current_step(ax, int(sh[ax] // 2))
+                    except Exception:
+                        pass
         except Exception:
             pass
 
-        # Update scale bar and axis labels
         try:
             self.viewer.scale_bar.visible = True
             unit = (getattr(layer, "metadata", {}) or {}).get("unit", "um")
@@ -761,8 +804,6 @@ class SegmentConfocalWidget(QWidget):
     # ----------------------- voxel/pixel apply -----------------------
 
     def _on_apply_voxel_clicked(self):
-        """Update active layer scale, sync all layers in same group_id,
-        refresh contexts, and recenter view."""
         layer = self.viewer.layers.selection.active
         if layer is None or not hasattr(layer, "data"):
             QMessageBox.information(self, "No image", "Please select an image layer first.")
@@ -770,7 +811,6 @@ class SegmentConfocalWidget(QWidget):
         nd = layer.data.ndim
         sc = list(getattr(layer, "scale", (1,) * nd))
         try:
-            # set new scale from editors
             if nd >= 3:
                 vz = float(self.edit_vz.value()) if self.edit_vz.isEnabled() and self.edit_vz.isVisible() else float(sc[-3])
                 vxy = float(self.edit_vyx.value())
@@ -786,7 +826,6 @@ class SegmentConfocalWidget(QWidget):
             gid = _ensure_group_id(md)
             layer.metadata = md
 
-            # propagate to all layers with same group_id (includes frangi/seg/base)
             for lyr in list(self.viewer.layers):
                 if not hasattr(lyr, "data") or lyr is layer:
                     continue
@@ -799,7 +838,6 @@ class SegmentConfocalWidget(QWidget):
                         sc2[-2:] = [new_triplet[1], new_triplet[2]]
                     lyr.scale = tuple(sc2)
 
-            # refresh last_frangi_ctx pixel_size if exists to reflect new scale
             if self._last_frangi_ctx:
                 try:
                     dim = int(self._last_frangi_ctx.get("dim", 2))
@@ -807,7 +845,6 @@ class SegmentConfocalWidget(QWidget):
                 except Exception:
                     pass
 
-            # Recenter view
             try:
                 self.viewer.reset_view()
             except Exception:
@@ -856,30 +893,19 @@ class SegmentConfocalWidget(QWidget):
     # ----------------------- Frangi filter -----------------------
 
     def _extract_current_2d_or_3d(self, layer) -> Tuple[np.ndarray, int, float]:
-        """
-        Return (img, dim, z_over_x_ratio). dim in {2,3}. For 2D ratio=1.0.
-        Accepts layer data shaped like (T,Z,Y,X) or (Z,Y,X) or (Y,X).
-        Respects the 2D-slice option if enabled.
-        """
         arr = np.asarray(layer.data)
         try:
             t_idx0 = int(self.viewer.dims.current_step[0]) if arr.ndim >= 4 else 0
         except Exception:
             t_idx0 = 0
         vol = np.squeeze(arr[t_idx0]) if arr.ndim >= 4 else arr
-        dims = (getattr(layer, "metadata", {}) or {}).get("dims")
-
         if vol.ndim == 3:
             sc = getattr(layer, "scale", (1,) * layer.data.ndim)
             z = float(sc[-3]) if len(sc) >= 3 else 1.0
             x = float(sc[-1]) if len(sc) >= 1 else 1.0
             ratio = (z / x) if (z > 0 and x > 0) else 1.0
             if self.chk_use_2d.isChecked():
-                # choose slice index from spin
-                if dims == "TCZYX":
-                    z_idx = int(np.clip(self.z_index_spin.value(), 0, vol.shape[0]-1))
-                else:
-                    z_idx = int(np.clip(self.z_index_spin.value(), 0, vol.shape[-3]-1))
+                z_idx = int(np.clip(self.z_index_spin.value(), 0, vol.shape[0]-1))
                 img2d = vol[z_idx]
                 return img2d.astype(np.float32, copy=False), 2, 1.0
             return vol.astype(np.float32, copy=False), 3, float(ratio)
@@ -902,7 +928,6 @@ class SegmentConfocalWidget(QWidget):
 
         device = self._resolve_device()
 
-        # Prepare input img for Frangi (and context for segmentation)
         try:
             img, dim, ratio = self._extract_current_2d_or_3d(layer)
             rng = float(img.max()) - float(img.min())
@@ -910,7 +935,6 @@ class SegmentConfocalWidget(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Slice error", f"Failed to get 2D/3D data: {e!r}"); return
 
-        # Run Frangi
         try:
             if dim == 3:
                 Fr = FrangiFilter(channels=1, kernel_size=2*int(self.kernel_spin.value())+1,
@@ -918,11 +942,10 @@ class SegmentConfocalWidget(QWidget):
             else:
                 Fr = FrangiFilter(channels=1, kernel_size=2*int(self.kernel_spin.value())+1,
                                   sigmas=sigmas, dim=2, device=device)
-            frangi_result = Fr(-np.expand_dims(img, 0))[0].cpu().numpy()
+            frangi_result_raw = Fr(-np.expand_dims(img, 0))[0].cpu().numpy()
         except Exception as e:
             QMessageBox.critical(self, "Frangi failed", f"FrangiFilter error: {e!r}"); return
 
-        # Prepare metadata BEFORE adding the layer so the inserted-callback can see is_frangi flag
         base_md = dict(getattr(layer, "metadata", {}) or {})
         base_md["source"] = base_md.get("source", _get_source_from_layer(layer))
         base_md["unit"] = _get_units_from_layer(layer)
@@ -931,15 +954,10 @@ class SegmentConfocalWidget(QWidget):
         if "channel_index" in base_md:
             base_md["channel_index"] = base_md["channel_index"]
 
-        # Add frangi layer with UPDATED scale from current active layer
-        name = "frangi"; existing = {l.name for l in self.viewer.layers}; k = 1
-        while name in existing: k += 1; name = f"frangi_{k}"
         sc = getattr(layer, "scale", (1,) * layer.data.ndim)
-        # compute desired scale strictly from active layer.scale
-        if frangi_result.ndim == 3:
+        if frangi_result_raw.ndim == 3:
             desired_scale = (float(sc[-3]), float(sc[-2]), float(sc[-1]))
         else:
-            # When running 2D on a slice from 3D, make sure we use (vy, vx) from the 3D pixel size
             try:
                 if self.chk_use_2d.isChecked() and layer.data.ndim >= 3:
                     _z, _y, _x = _get_pixel_size_tuple(layer, 3)
@@ -949,33 +967,106 @@ class SegmentConfocalWidget(QWidget):
             except Exception:
                 desired_scale = (float(sc[-2]), float(sc[-1]))
 
-        # Create with both scale and metadata set so the inserted handler won't override it
-        new_layer = self.viewer.add_image(np.asarray(frangi_result), name=name, scale=desired_scale, metadata=base_md)
+        name = "frangi"; existing = {l.name for l in self.viewer.layers}; k = 1
+        while name in existing: k += 1; name = f"frangi_{k}"
+        self._frangi_layer = self.viewer.add_image(np.asarray(frangi_result_raw), name=name, scale=desired_scale, metadata=base_md)
         try:
-            # be extra robust across napari versions
-            new_layer.scale = desired_scale
+            self._frangi_layer.scale = desired_scale
         except Exception:
             pass
 
-        md = base_md  # for context building below
-
-        # Save context
         self._last_frangi_ctx = dict(
             image=img,
-            frangi=frangi_result,
+            frangi_raw=frangi_result_raw,
+            frangi=frangi_result_raw,
             dim=dim,
             pixel_size=_get_pixel_size_tuple(layer, dim),
             device=device,
-            source=md.get("source"),
-            channel_index=md.get("channel_index"),
-            unit=md.get("unit", "um"),
+            source=base_md.get("source"),
+            channel_index=base_md.get("channel_index"),
+            unit=base_md.get("unit", "um"),
         )
 
-        # update preview text
+        # enable rescale controls
+        self.chk_rescale.setEnabled(True)
+        self._apply_low_high_binding(self._low_percent)
+        self.range_slider.setEnabled(self.chk_rescale.isChecked())
+        if self.chk_rescale.isChecked():
+            self._recompute_rescaled_frangi()
+
         self._update_segmentation_preview()
 
         dimtxt = "2D (slice)" if (dim == 2 and self.chk_use_2d.isChecked()) else ("3D" if dim == 3 else "2D")
         self.kw_preview.append(f"Frangi OK | {dimtxt} | sigmas={np.array(sigmas)} | device={device}")
+
+    # --- rescale handlers ---
+
+    def _apply_low_high_binding(self, low: int):
+        """Clamp low to [0,20], set high = 100 - low (auto-clamped to [80,100]), update slider+label."""
+        low = max(0, min(int(low), 20))
+        high = 100 - low
+        # enforce high floor 80
+        if high < 80:
+            high = 80
+            low = 20  # maintain relation
+        # write back to slider and label
+        self.range_slider.blockSignals(True)
+        self.range_slider.setValue((low, high))
+        self.range_slider.blockSignals(False)
+        self._low_percent = low
+        self.range_lbl.setText(f"percentiles: {low}%–{high}%")
+
+    def _on_rescale_params_changed(self, *args):
+        """Bind high = 100 - low. Detect which handle moved and adjust accordingly."""
+        try:
+            a, b = self.range_slider.value()
+        except Exception:
+            v = self.range_slider.value()
+            a, b = (v[0], v[1]) if isinstance(v, (tuple, list)) else (0, 100)
+
+        # infer user's intent: did they move low or high?
+        proposed_low_from_low = a
+        proposed_low_from_high = 100 - b
+
+        # choose the intent that changed more from current low
+        if abs(proposed_low_from_low - self._low_percent) >= abs(proposed_low_from_high - self._low_percent):
+            new_low = proposed_low_from_low
+        else:
+            new_low = proposed_low_from_high
+
+        self._apply_low_high_binding(new_low)
+
+        if self.chk_rescale.isChecked():
+            self._recompute_rescaled_frangi()
+
+    def _recompute_rescaled_frangi(self):
+        ctx = self._last_frangi_ctx
+        if not ctx or ctx.get("frangi_raw") is None or self._frangi_layer is None:
+            return
+        raw = np.asarray(ctx["frangi_raw"])
+
+        low, high = self.range_slider.value()
+        low = int(low); high = int(high)
+
+        lo = float(np.percentile(raw, low))
+        hi = float(np.percentile(raw, high))
+        if hi <= lo:
+            hi = lo + 1e-6
+        rescaled = rescale_intensity(raw, in_range=(lo, hi))
+
+        try:
+            self._frangi_layer.data = np.asarray(rescaled)
+        except Exception:
+            md = dict(getattr(self._frangi_layer, "metadata", {}) or {})
+            name = self._frangi_layer.name
+            sc = tuple(getattr(self._frangi_layer, "scale", (1,) * rescaled.ndim))
+            try:
+                self.viewer.layers.remove(self._frangi_layer)
+            except Exception:
+                pass
+            self._frangi_layer = self.viewer.add_image(np.asarray(rescaled), name=name, scale=sc, metadata=md)
+        ctx["frangi"] = np.asarray(rescaled)
+        self._update_segmentation_preview()
 
     # ----------------------- Segmentation -----------------------
 
@@ -983,7 +1074,6 @@ class SegmentConfocalWidget(QWidget):
         if not self._last_frangi_ctx:
             return None
         ctx = self._last_frangi_ctx
-        # IMPORTANT: recompute pixel_size from CURRENT active layer scale to reflect any updates
         layer = self.viewer.layers.selection.active
         try:
             fresh_px = _get_pixel_size_tuple(layer, ctx["dim"])
@@ -1007,6 +1097,7 @@ class SegmentConfocalWidget(QWidget):
         if kwargs is None:
             self.kw_preview.setPlainText("Run Frangi first to preview segmentation() call.")
             return
+        low, high = self.range_slider.value()
         lines = [
             "segmentation() will be called with:",
             f"  image: float32 array, shape={np.asarray(kwargs['image']).shape}",
@@ -1016,7 +1107,8 @@ class SegmentConfocalWidget(QWidget):
             f"  n_fore={kwargs['n_fore']}  n_back={kwargs['n_back']}  max_iter={kwargs['max_iter']}",
             f"  device='{kwargs['device']}'",
             "Notes:",
-            "  • If 'Run on 2d slice' is enabled, 'image' is that 2D slice and pixel_size is (y,x)."
+            "  • If 'Run on 2d slice' is enabled, 'image' is that 2D slice and pixel_size is (y,x).",
+            f"  • Intensity rescale: {'ON' if self.chk_rescale.isChecked() else 'OFF'}; percentiles={int(low)}%–{int(high)}% (high = 100 - low)"
         ]
         self.kw_preview.setPlainText("\n".join(lines))
 
@@ -1103,17 +1195,14 @@ class SegmentConfocalWidget(QWidget):
 # ----------------------- napari factory / plugin hooks -----------------------
 
 def create_segment_confocal_widget(viewer):
-    """Factory for creating the widget in scripts."""
     return SegmentConfocalWidget(viewer)
 
 
 def napari_experimental_provide_dock_widget():
-    """Allow napari plugin discovery to pick up this widget."""
     return [SegmentConfocalWidget]
 
 
 if __name__ == "__main__":
-    # Minimal demo runner for manual testing
     try:
         import napari
         v = napari.Viewer()
@@ -1124,4 +1213,3 @@ if __name__ == "__main__":
         import traceback
         print("Failed to launch napari demo:", e)
         traceback.print_exc()
-
