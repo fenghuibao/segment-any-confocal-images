@@ -42,7 +42,8 @@ class GaussianSmoothing(nn.Module):
             [
                 torch.arange(-self.padd, self.padd+1, dtype=torch.float32)
                 for size in kernel_size
-            ]
+            ],
+            indexing = 'ij'
         )
         for size, std, mgrid in zip(kernel_size, sigma, meshgrids):
             mean = size // 2
@@ -54,15 +55,6 @@ class GaussianSmoothing(nn.Module):
 
         # Reshape to depthwise convolutional weight
         kernel = kernel.view(1, 1, *kernel.size())
-        '''
-        if order == 'xx':
-            kernel[0, 0] = ((kernel[0, 0] * (meshgrids[1] ** 2 - self.std ** 2) / self.std ** 4))
-            print(kernel)
-        elif order == 'yy':
-            kernel[0, 0] = ((kernel[0, 0] * (meshgrids[0] ** 2 - self.std ** 2) / self.std ** 4))
-        elif order == 'xy':
-            kernel[0, 0] = kernel[0, 0] * meshgrids[0] * meshgrids[1].T / self.std ** 4
-        '''
         if dim == 2:
             if order == 'x':
                 kernel[0, 0] = - meshgrids[1] / self.std ** 2 * kernel[0, 0]

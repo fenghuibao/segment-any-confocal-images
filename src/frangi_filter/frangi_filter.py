@@ -10,7 +10,6 @@ class FrangiFilter(nn.Module):
 
     def __init__(self, channels, kernel_size, sigmas, dim, device='cpu', zx_ratio=1, alpha=0.5, beta=0.5, gamma=2):
         """
-        Apply Soft Frangi filter on a 3d tensor.
         Arguments:
             channels (int, sequence): Number of channels of the input tensors. Output will
                 have this number of channels as well.
