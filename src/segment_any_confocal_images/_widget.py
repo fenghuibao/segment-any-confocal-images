@@ -18,7 +18,7 @@ from superqt import QRangeSlider  # dual-end range slider
 # external Frangi
 from frangi_filter.frangi_filter import *
 
-# external segmentation entry
+# external segmentation entry (returns (label_uint8, SegmentationInfo), supports progress)
 from SegmentAnyConfocal.segmentation_ import * 
 
 # intensity rescale
@@ -162,11 +162,12 @@ def _get_pixel_size_tuple(layer, ndim: int):
         raise ValueError(f"Unsupported ndim for pixel size: {ndim}")
 
 
-# ----------------------- worker for segmentation (progress) -----------------------
+# ----------------------- worker for segmentation (with progress) -----------------------
 
 class SegWorker(QObject):
-    finished = Signal(object, object)  # (result_or_None, error_or_None)
+    finished = Signal(object, object)  # (payload_or_None, error_or_None); payload=(seg, info)
     started = Signal()
+    progress = Signal(int, float)      # (iteration, delta_logL)
 
     def __init__(self, kwargs: Dict[str, Any]):
         super().__init__()
@@ -175,9 +176,19 @@ class SegWorker(QObject):
     def run(self):
         self.started.emit()
         try:
-            seg = segmentation(**self.kwargs)
-            seg = seg[0].cpu().numpy()
-            self.finished.emit(seg, None)
+            def _progress_cb(it, delta):
+                # emit progress from worker thread
+                try:
+                    self.progress.emit(int(it), float(delta))
+                except Exception:
+                    pass
+
+            kwargs = dict(self.kwargs)
+            kwargs["progress"] = _progress_cb
+
+            seg, info = segmentation(**kwargs)  # seg: np.uint8, info: SegmentationInfo
+            seg = seg[0]
+            self.finished.emit((seg, info), None)
         except Exception as e:
             self.finished.emit(None, e)
 
@@ -215,6 +226,7 @@ class SegmentConfocalWidget(QWidget):
         self.open_btn = QPushButton("Select File")
         self.open_btn.clicked.connect(self._open_image_tc_zyx)
         self.device_combo = QComboBox(); self._populate_devices()
+        self.device_combo.currentTextChanged.connect(self._on_device_changed)
         top_form.addWidget(self.open_btn, 0, 0)
         top_form.addWidget(QLabel("Device:"), 0, 1, alignment=Qt.AlignRight)
         top_form.addWidget(self.device_combo, 0, 2)
@@ -321,7 +333,7 @@ class SegmentConfocalWidget(QWidget):
         self.range_slider.setValue((0, 100))  # low=0, high=100
         self.range_slider.setEnabled(False)
 
-        self.range_lbl = QLabel("percentiles: 0%–100%  (high = 100 - low)")
+        self.range_lbl = QLabel("percentiles: 0%–100%")
 
         def _toggle_rescale(v):
             enabled = bool(v) and (self._last_frangi_ctx.get("frangi_raw") is not None)
@@ -435,20 +447,43 @@ class SegmentConfocalWidget(QWidget):
                     choices.append("mps")
             except Exception:
                 pass
+
         for c in choices:
             self.device_combo.addItem(c)
 
+        # Prefer CUDA, otherwise MPS, otherwise CPU
+        if "cuda" in choices:
+            self.device_combo.setCurrentText("cuda")
+        elif "mps" in choices:
+            self.device_combo.setCurrentText("mps")
+        else:
+            self.device_combo.setCurrentText("cpu")
+
+        if self._last_frangi_ctx:
+            self._last_frangi_ctx["device"] = self._resolve_device()
+
+        # <-- add this guard so we don't access kw_preview before it exists
+        if hasattr(self, "kw_preview"):
+            self._update_segmentation_preview()
+
+
+
     def _resolve_device(self) -> str:
-        choice = self.device_combo.currentText().lower()
         if torch is None:
             return "cpu"
-        if choice == "cuda" and torch.cuda.is_available():
-            return "cuda"
-        if choice == "mps" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return "mps"
-        if choice in ("cuda", "mps"):
-            QMessageBox.information(self, "Device fallback", f"{choice} not available. Falling back to CPU.")
+        try:
+            if torch.cuda.is_available():
+                return "cuda"
+        except Exception:
+            pass
+        try:
+            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                return "mps"
+        except Exception:
+            pass
         return "cpu"
+
+
 
     # ----------------------- open & normalize -----------------------
 
@@ -515,6 +550,10 @@ class SegmentConfocalWidget(QWidget):
 
         self._fit_view_and_scalebar()
         self._update_info()
+        try:
+            self._update_segmentation_preview()
+        except Exception:
+            pass
 
     def _on_layer_inserted(self, event=None):
         layer = getattr(event, "value", None)
@@ -626,6 +665,11 @@ class SegmentConfocalWidget(QWidget):
                 pass
 
     # ----------------------- events -----------------------
+    def _on_device_changed(self, *_):
+        if self._last_frangi_ctx:
+            self._last_frangi_ctx["device"] = self._resolve_device()
+        self._update_segmentation_preview()
+
 
     def _on_active_changed(self, event=None):
         self._view_initialized = False
@@ -1089,7 +1133,7 @@ class SegmentConfocalWidget(QWidget):
             n_fore=int(self.nfore_spin.value()),
             n_back=int(self.nback_spin.value()),
             max_iter=int(self.maxiter_spin.value()),
-            device=ctx["device"],
+            device=self._resolve_device(),  # always use CURRENT device
         )
 
     def _update_segmentation_preview(self):
@@ -1121,6 +1165,14 @@ class SegmentConfocalWidget(QWidget):
         if kwargs is None:
             return
 
+        # show overlay start
+        try:
+            self.viewer.text_overlay.visible = True
+            self.viewer.text_overlay.position = "bottom_left"
+            self.viewer.text_overlay.text = "Segmentation starting..."
+        except Exception:
+            pass
+
         self.seg_progress.setRange(0, 0)
         self.seg_progress.setFormat("Running segmentation…")
         self.seg_btn.setEnabled(False)
@@ -1130,20 +1182,50 @@ class SegmentConfocalWidget(QWidget):
         self._seg_worker.moveToThread(self._seg_thread)
         self._seg_thread.started.connect(self._seg_worker.run)
         self._seg_worker.started.connect(lambda: None)
-        def _finished(result, error):
+
+        # connect progress to UI slot
+        self._seg_worker.progress.connect(self._on_seg_progress)
+
+        def _finished(payload, error):
             self.seg_progress.setRange(0, 100)
             if error is not None:
                 self.seg_progress.setValue(0)
                 QMessageBox.critical(self, "Segmentation failed", f"segmentation() error: {error!r}")
             else:
                 self.seg_progress.setValue(100)
-                self._add_segmentation_result(result)
+                seg, info = payload  # unpack (np.uint8, SegmentationInfo)
+                self._add_segmentation_result(seg, info)
             self.seg_btn.setEnabled(True)
             self._seg_thread.quit(); self._seg_thread.wait(); self._seg_worker.deleteLater(); self._seg_thread.deleteLater()
+
         self._seg_worker.finished.connect(_finished)
         self._seg_thread.start()
 
-    def _add_segmentation_result(self, seg):
+    def _on_seg_progress(self, iteration: int, delta: float):
+        """
+        Live progress from worker: update viewer overlay and preview head line.
+        """
+        # overlay
+        try:
+            self.viewer.text_overlay.visible = True
+            self.viewer.text_overlay.position = "bottom_left"
+            if np.isfinite(delta):
+                self.viewer.text_overlay.text = f"Segmentation iter: {iteration} | ΔlogL: {delta:.3e}"
+            else:
+                self.viewer.text_overlay.text = f"Segmentation iter: {iteration} | ΔlogL: --"
+        except Exception:
+            pass
+
+        # preview top line
+        try:
+            base = self.kw_preview.toPlainText() if hasattr(self.kw_preview, "toPlainText") else ""
+            head = f"[iter={iteration}] ΔlogL={delta:.3e}" if np.isfinite(delta) else f"[iter={iteration}] ΔlogL=--"
+            lines = [head] + base.splitlines()
+            self.kw_preview.setPlainText("\n".join(lines[:30]))
+        except Exception:
+            pass
+        
+    def _add_segmentation_result(self, seg, info=None):
         try:
             layer = self.viewer.layers.selection.active
             md_base = dict(getattr(layer, "metadata", {}) or {}) if layer else {}
@@ -1151,21 +1233,41 @@ class SegmentConfocalWidget(QWidget):
             sc_layer = getattr(layer, "scale", None) if layer else None
             add_kwargs = {}
             if sc_layer is not None:
-                if seg_np.ndim == 3: add_kwargs["scale"] = (sc_layer[-3], sc_layer[-2], sc_layer[-1])
-                elif seg_np.ndim == 2: add_kwargs["scale"] = (sc_layer[-2], sc_layer[-1])
+                if seg_np.ndim == 3:
+                    add_kwargs["scale"] = (sc_layer[-3], sc_layer[-2], sc_layer[-1])
+                elif seg_np.ndim == 2:
+                    add_kwargs["scale"] = (sc_layer[-2], sc_layer[-1])
 
-            name = "segmentation"; existing = {l.name for l in self.viewer.layers}; k = 1
-            while name in existing: k += 1; name = f"segmentation_{k}"
+            name = "segmentation"
+            existing = {l.name for l in self.viewer.layers}
+            k = 1
+            while name in existing:
+                k += 1
+                name = f"segmentation_{k}"
 
-            if np.issubdtype(seg_np.dtype, np.integer) or seg_np.dtype == bool:
-                new_layer = self.viewer.add_labels(seg_np.astype(np.int32, copy=False), name=name, **add_kwargs)
-            else:
-                new_layer = self.viewer.add_image(seg_np, name=name, **add_kwargs)
+            # --- changed block: always add as 8-bit Image for correct export ---
+            # convert to visible mask (0/255) regardless of input dtype
+            mask8 = ((seg_np.astype(np.int64) > 0).astype(np.uint8) * 255)
+            mask8 = np.ascontiguousarray(mask8)  # safety for writers
 
+            new_layer = self.viewer.add_image(
+                mask8,
+                name=name,
+                rgb=False,                      # prevent RGB inference; keep Z,Y,X as volume
+                blending="translucent_no_depth",
+                **add_kwargs,
+            )
             try:
-                new_layer.opacity = 0.5
+                new_layer.contrast_limits = (0, 255)
             except Exception:
                 pass
+
+            # annotate dims for downstream tools/writers (optional but helpful)
+            try:
+                md_base["dims_out"] = "ZYX" if mask8.ndim == 3 else "YX"
+            except Exception:
+                pass
+            # --- end changed block ---
 
             ctx = self._last_frangi_ctx
             new_md = dict(md_base)
@@ -1173,6 +1275,16 @@ class SegmentConfocalWidget(QWidget):
             new_md["source"] = ctx.get("source", _get_source_from_layer(layer) if layer else None)
             new_md["is_segmentation"] = True
             new_md["group_id"] = _get_group_id(self.viewer.layers.selection.active) or _ensure_group_id(new_md)
+
+            # keep the info you added earlier
+            if info is not None:
+                try:
+                    new_md["seg_iterations_run"] = int(getattr(info, "iterations_run", 0))
+                    new_md["seg_delta_loglh_trace"] = list(getattr(info, "deltas", []))
+                    new_md["seg_converged"] = bool(getattr(info, "converged", False))
+                except Exception:
+                    pass
+
             new_layer.metadata = new_md
 
             try:
@@ -1190,6 +1302,11 @@ class SegmentConfocalWidget(QWidget):
             )
         except Exception as e:
             QMessageBox.critical(self, "Add result failed", f"Failed to add segmentation result: {e!r}")
+
+
+
+
+
 
 
 # ----------------------- napari factory / plugin hooks -----------------------
