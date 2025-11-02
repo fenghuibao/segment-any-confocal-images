@@ -19,7 +19,7 @@ from superqt import QRangeSlider  # dual-end range slider
 from frangi_filter.frangi_filter import *
 
 # external segmentation entry (returns (label_uint8, SegmentationInfo), supports progress)
-from SegmentAnyConfocal.segmentation_ import * 
+from SegmentAnyConfocal.SegmentAnyConfocal import * 
 
 # intensity rescale
 from skimage.exposure import rescale_intensity
