@@ -8,6 +8,8 @@ from torch.nn import functional as F
 Gaussian smoothing with Pytorch.
 Source:
 https://discuss.pytorch.org/t/is-there-anyway-to-do-gaussian-filtering-for-an-image-2d-3d-in-pytorch/12351/10
+https://dsp.stackexchange.com/questions/78280/are-scipy-second-order-gaussian-derivatives-correct
+https://github.com/ilyas-sid/SoftFrangiFilter2D
 """
 
 
@@ -55,6 +57,8 @@ class GaussianSmoothing(nn.Module):
 
         # Reshape to depthwise convolutional weight
         kernel = kernel.view(1, 1, *kernel.size())
+
+        # Derivatives
         if dim == 2:
             if order == 'x':
                 kernel[0, 0] = - meshgrids[1] / self.std ** 2 * kernel[0, 0]

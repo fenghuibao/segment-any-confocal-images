@@ -37,8 +37,6 @@ If napari is not already installed, you can install `segment-any-confocal-images
 pip install "segment-any-confocal-images[all]"
 ```
 
-
-
 ## Contributing
 
 Contributions are very welcome. Tests can be run with [tox], please ensure

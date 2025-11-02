@@ -1,9 +1,12 @@
+#!/usr/bin/env python3
+# Author: Huibao Feng
+# Date: 2025-11-02
+
 import torch
 from torch import nn
 from .gaussian_smoothing import GaussianSmoothing
 from itertools import combinations_with_replacement
 import numpy as np
-import pickle
 
 
 class FrangiFilter(nn.Module):
@@ -103,7 +106,6 @@ class FrangiFilter(nn.Module):
                 r_b = lambda1.abs() / torch.sqrt(lambda2 * lambda3) 
 
             s = torch.sqrt((eigvals**2).sum(dim=0)) 
-
             vals = 1.0 - torch.exp(-(r_a**2) / (2 * (self.alpha**2)))             # plate sensitivity
             vals = vals * torch.exp(-(r_b**2) / (2 * (self.beta**2)))              # blobness
             vals = vals * (1.0 - torch.exp(-(s**2) / (2 * (self.gamma**2))))   # structuredness
@@ -115,12 +117,10 @@ class FrangiFilter(nn.Module):
 
     def forward(self, image):
         """
-        Apply Soft Frangi filter on a batch of images.
+        Apply Frangi filter on a batch of images.
         Arguments:
             img (torch.Tensor, sequence): Tensor of shape (bs, channels, h, w)
         """
         image = torch.tensor(image, dtype=torch.float32).to(self.device)
         frangi_resp = self._calc_frangi_response(image)
-        with open('frangi_resp.pickle', 'wb') as f:
-            pickle.dump(frangi_resp, f)
         return frangi_resp
